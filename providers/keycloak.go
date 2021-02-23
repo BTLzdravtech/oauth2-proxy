@@ -94,5 +94,17 @@ func (p *KeycloakProvider) EnrichSession(ctx context.Context, s *sessions.Sessio
 	}
 	s.Email = email
 
+	user, err := json.Get("name").String()
+	if err != nil {
+		return fmt.Errorf("unable to extract name from userinfo endpoint: %v", err)
+	}
+	s.User = user
+
+	preferredUsername, err := json.Get("preferred_username").String()
+	if err != nil {
+		return fmt.Errorf("unable to extract preferred_username from userinfo endpoint: %v", err)
+	}
+	s.PreferredUsername = preferredUsername
+
 	return nil
 }
