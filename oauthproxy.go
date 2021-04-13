@@ -8,8 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/justinas/alice"
@@ -21,6 +24,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/authentication/basic"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/cookies"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/encryption"
+	proxyhttp "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/http"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/ip"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/middleware"
@@ -31,6 +35,7 @@ import (
 )
 
 const (
+	schemeHTTP      = "http"
 	schemeHTTPS     = "https"
 	applicationJSON = "application/json"
 )
@@ -55,15 +60,12 @@ type allowedRoute struct {
 
 // OAuthProxy is the main authentication proxy
 type OAuthProxy struct {
-	CookieSeed     string
-	CookieName     string
 	CSRFCookieName string
 	CookieDomains  []string
 	CookiePath     string
 	CookieSecure   bool
 	CookieHTTPOnly bool
 	CookieExpire   time.Duration
-	CookieRefresh  time.Duration
 	CookieSameSite string
 	Validator      func(string) bool
 
@@ -83,16 +85,7 @@ type OAuthProxy struct {
 	ProxyPrefix         string
 	basicAuthValidator  basic.Validator
 	serveMux            http.Handler
-	SetXAuthRequest     bool
-	PassBasicAuth       bool
-	SetBasicAuth        bool
 	SkipProviderButton  bool
-	PassUserHeaders     bool
-	BasicAuthPassword   string
-	PassAccessToken     bool
-	SetAuthorization    bool
-	PassAuthorization   bool
-	PreferEmailToUser   bool
 	skipAuthPreflight   bool
 	skipJwtBearerTokens bool
 	realClientIPParser  ipapi.RealClientIPParser
@@ -102,6 +95,7 @@ type OAuthProxy struct {
 	headersChain alice.Chain
 	preAuthChain alice.Chain
 	pageWriter   pagewriter.Writer
+	server       proxyhttp.Server
 }
 
 // NewOAuthProxy creates a new instance of OAuthProxy from the options provided
@@ -128,7 +122,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		Footer:           opts.Templates.Footer,
 		Version:          VERSION,
 		Debug:            opts.Templates.Debug,
-		ProviderName:     buildProviderName(opts.GetProvider(), opts.ProviderName),
+		ProviderName:     buildProviderName(opts.GetProvider(), opts.Providers[0].Name),
 		SignInMessage:    buildSignInMessage(opts),
 		DisplayLoginForm: basicAuthValidator != nil && opts.Templates.DisplayLoginForm,
 	})
@@ -142,7 +136,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 	}
 
 	if opts.SkipJwtBearerTokens {
-		logger.Printf("Skipping JWT tokens from configured OIDC issuer: %q", opts.OIDCIssuerURL)
+		logger.Printf("Skipping JWT tokens from configured OIDC issuer: %q", opts.Providers[0].OIDCConfig.IssuerURL)
 		for _, issuer := range opts.ExtraJwtIssuers {
 			logger.Printf("Skipping JWT tokens from extra JWT issuer: %q", issuer)
 		}
@@ -152,7 +146,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		redirectURL.Path = fmt.Sprintf("%s/callback", opts.ProxyPrefix)
 	}
 
-	logger.Printf("OAuthProxy configured for %s Client ID: %s", opts.GetProvider().Data().ProviderName, opts.ClientID)
+	logger.Printf("OAuthProxy configured for %s Client ID: %s", opts.GetProvider().Data().ProviderName, opts.Providers[0].ClientID)
 	refresh := "disabled"
 	if opts.Cookie.Refresh != time.Duration(0) {
 		refresh = fmt.Sprintf("after %s", opts.Cookie.Refresh)
@@ -184,16 +178,13 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		return nil, fmt.Errorf("could not build headers chain: %v", err)
 	}
 
-	return &OAuthProxy{
-		CookieName:     opts.Cookie.Name,
+	p := &OAuthProxy{
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.Cookie.Name, "csrf"),
-		CookieSeed:     opts.Cookie.Secret,
 		CookieDomains:  opts.Cookie.Domains,
 		CookiePath:     opts.Cookie.Path,
 		CookieSecure:   opts.Cookie.Secure,
 		CookieHTTPOnly: opts.Cookie.HTTPOnly,
 		CookieExpire:   opts.Cookie.Expire,
-		CookieRefresh:  opts.Cookie.Refresh,
 		CookieSameSite: opts.Cookie.SameSite,
 		Validator:      validator,
 
@@ -223,19 +214,72 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		headersChain:       headersChain,
 		preAuthChain:       preAuthChain,
 		pageWriter:         pageWriter,
-	}, nil
+	}
+
+	if err := p.setupServer(opts); err != nil {
+		return nil, fmt.Errorf("error setting up server: %v", err)
+	}
+
+	return p, nil
+}
+
+func (p *OAuthProxy) Start() error {
+	if p.server == nil {
+		// We have to call setupServer before Start is called.
+		// If this doesn't happen it's a programming error.
+		panic("server has not been initialised")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Observe signals in background goroutine.
+	go func() {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
+		<-sigint
+		cancel() // cancel the context
+	}()
+
+	return p.server.Start(ctx)
+}
+
+func (p *OAuthProxy) setupServer(opts *options.Options) error {
+	serverOpts := proxyhttp.Opts{
+		Handler:           p,
+		BindAddress:       opts.Server.BindAddress,
+		SecureBindAddress: opts.Server.SecureBindAddress,
+		TLS:               opts.Server.TLS,
+	}
+
+	appServer, err := proxyhttp.NewServer(serverOpts)
+	if err != nil {
+		return fmt.Errorf("could not build app server: %v", err)
+	}
+
+	metricsServer, err := proxyhttp.NewServer(proxyhttp.Opts{
+		Handler:           middleware.DefaultMetricsHandler,
+		BindAddress:       opts.MetricsServer.BindAddress,
+		SecureBindAddress: opts.MetricsServer.SecureBindAddress,
+		TLS:               opts.MetricsServer.TLS,
+	})
+	if err != nil {
+		return fmt.Errorf("could not build metrics server: %v", err)
+	}
+
+	p.server = proxyhttp.NewServerGroup(appServer, metricsServer)
+	return nil
 }
 
 // buildPreAuthChain constructs a chain that should process every request before
 // the OAuth2 Proxy authentication logic kicks in.
 // For example forcing HTTPS or health checks.
 func buildPreAuthChain(opts *options.Options) (alice.Chain, error) {
-	chain := alice.New(middleware.NewScope(opts.ReverseProxy))
+	chain := alice.New(middleware.NewScope(opts.ReverseProxy, opts.Logging.RequestIDHeader))
 
 	if opts.ForceHTTPS {
-		_, httpsPort, err := net.SplitHostPort(opts.HTTPSAddress)
+		_, httpsPort, err := net.SplitHostPort(opts.Server.SecureBindAddress)
 		if err != nil {
-			return alice.Chain{}, fmt.Errorf("invalid HTTPS address %q: %v", opts.HTTPAddress, err)
+			return alice.Chain{}, fmt.Errorf("invalid HTTPS address %q: %v", opts.Server.SecureBindAddress, err)
 		}
 		chain = chain.Append(middleware.NewRedirectToHTTPS(httpsPort))
 	}
@@ -243,6 +287,7 @@ func buildPreAuthChain(opts *options.Options) (alice.Chain, error) {
 	healthCheckPaths := []string{opts.PingPath}
 	healthCheckUserAgents := []string{opts.PingUserAgent}
 	if opts.GCPHealthChecks {
+		logger.Printf("WARNING: GCP HealthChecks are now deprecated: Reconfigure apps to use the ping path for liveness and readiness checks, set the ping user agent to \"GoogleHC/1.0\" to preserve existing behaviour")
 		healthCheckPaths = append(healthCheckPaths, "/liveness_check", "/readiness_check")
 		healthCheckUserAgents = append(healthCheckUserAgents, "GoogleHC/1.0")
 	}
@@ -250,9 +295,15 @@ func buildPreAuthChain(opts *options.Options) (alice.Chain, error) {
 	// To silence logging of health checks, register the health check handler before
 	// the logging handler
 	if opts.Logging.SilencePing {
-		chain = chain.Append(middleware.NewHealthCheck(healthCheckPaths, healthCheckUserAgents), LoggingHandler)
+		chain = chain.Append(
+			middleware.NewHealthCheck(healthCheckPaths, healthCheckUserAgents),
+			middleware.NewRequestLogger(),
+		)
 	} else {
-		chain = chain.Append(LoggingHandler, middleware.NewHealthCheck(healthCheckPaths, healthCheckUserAgents))
+		chain = chain.Append(
+			middleware.NewRequestLogger(),
+			middleware.NewHealthCheck(healthCheckPaths, healthCheckUserAgents),
+		)
 	}
 
 	chain = chain.Append(middleware.NewRequestMetricsWithDefaultRegistry())
@@ -277,7 +328,7 @@ func buildSessionChain(opts *options.Options, sessionStore sessionsapi.SessionSt
 	}
 
 	if validator != nil {
-		chain = chain.Append(middleware.NewBasicAuthSessionLoader(validator))
+		chain = chain.Append(middleware.NewBasicAuthSessionLoader(validator, opts.HtpasswdUserGroups, opts.LegacyPreferEmailToUser))
 	}
 
 	chain = chain.Append(middleware.NewStoredSessionLoader(&middleware.StoredSessionLoaderOptions{
@@ -512,13 +563,7 @@ func (p *OAuthProxy) serveHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // RobotsTxt disallows scraping pages from the OAuthProxy
 func (p *OAuthProxy) RobotsTxt(rw http.ResponseWriter, req *http.Request) {
-	_, err := fmt.Fprintf(rw, "User-agent: *\nDisallow: /")
-	if err != nil {
-		logger.Printf("Error writing robots.txt: %v", err)
-		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
-		return
-	}
-	rw.WriteHeader(http.StatusOK)
+	p.pageWriter.WriteRobotsTxt(rw, req)
 }
 
 // ErrorPage writes an error response
@@ -531,7 +576,14 @@ func (p *OAuthProxy) ErrorPage(rw http.ResponseWriter, req *http.Request, code i
 		redirectURL = "/"
 	}
 
-	p.pageWriter.WriteErrorPage(rw, code, redirectURL, appError, messages...)
+	scope := middlewareapi.GetRequestScope(req)
+	p.pageWriter.WriteErrorPage(rw, pagewriter.ErrorPageOpts{
+		Status:      code,
+		RedirectURL: redirectURL,
+		RequestID:   scope.RequestID,
+		AppError:    appError,
+		Messages:    messages,
+	})
 }
 
 // IsAllowedRequest is used to check if auth should be skipped for this request
@@ -592,7 +644,7 @@ func (p *OAuthProxy) SignInPage(rw http.ResponseWriter, req *http.Request, code 
 		redirectURL = "/"
 	}
 
-	p.pageWriter.WriteSignInPage(rw, redirectURL)
+	p.pageWriter.WriteSignInPage(rw, req, redirectURL)
 }
 
 // ManualSignIn handles basic auth logins to the proxy
@@ -906,6 +958,11 @@ func (p *OAuthProxy) getOAuthRedirectURI(req *http.Request) string {
 	rd := *p.redirectURL
 	rd.Host = requestutil.GetRequestHost(req)
 	rd.Scheme = requestutil.GetRequestProto(req)
+
+	// If there's no scheme in the request, we should still include one
+	if rd.Scheme == "" {
+		rd.Scheme = schemeHTTP
+	}
 
 	// If CookieSecure is true, return `https` no matter what
 	// Not all reverse proxies set X-Forwarded-Proto
